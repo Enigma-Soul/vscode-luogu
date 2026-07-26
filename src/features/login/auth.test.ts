@@ -48,6 +48,8 @@ class EventEmitter<T> {
   fire(event: T) {
     for (const listener of this.listeners) listener(event);
   }
+
+  dispose() {}
 }
 
 vi.mock('vscode', () => ({
@@ -111,5 +113,20 @@ describe('LuoguAuthProvider', () => {
     await expect(withTimeout(provider.getSessions())).rejects.toThrow(
       'network unavailable'
     );
+  });
+
+  it('cleans up and stops reacting to secret changes after disposal', async () => {
+    const storage = new FakeSecretStorage();
+    const provider = new LuoguAuthProvider(storage as never);
+
+    await expect(withTimeout(provider.getSessions())).resolves.toEqual([]);
+
+    expect(() => provider.dispose()).not.toThrow();
+
+    // dispose 后触发 secret 变更，不应抛错或挂起重载
+    storage.fire(LuoguAuthProvider.SecretKey);
+
+    // 仍可读取已缓存的匿名会话，不挂起
+    await expect(withTimeout(provider.getSessions())).resolves.toEqual([]);
   });
 });

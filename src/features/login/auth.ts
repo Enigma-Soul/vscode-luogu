@@ -15,26 +15,66 @@ class LuoguSession implements vscode.AuthenticationSession {
 }
 
 export default class LuoguAuthProvider
-  implements vscode.AuthenticationProvider
+  implements vscode.AuthenticationProvider, vscode.Disposable
 {
   static readonly ProviderId = 'luogu-auth';
   static readonly SecretKey = 'luogu-auth';
-  private _sessionChangeEmitter =
+  private readonly _sessionChangeEmitter =
     new vscode.EventEmitter<vscode.AuthenticationProviderAuthenticationSessionsChangeEvent>();
+  private readonly _disposables: vscode.Disposable[] = [];
   private cache: LuoguSession;
   private cacheLock: Promise<void>;
   private status: boolean = false;
+  private disposed = false;
+  // dispose 时 reject，让挂起的网络请求快速失败，避免 cacheLock 永久挂起
+  private disposeReject!: (err: Error) => void;
+  private readonly disposeGate = new Promise<never>((_, reject) => {
+    this.disposeReject = (err: Error) => reject(err);
+  });
+
   constructor(private readonly secretStorage: vscode.SecretStorage) {
     this.cache = {} as LuoguSession;
     this.cacheLock = this.initialize();
-    this.secretStorage.onDidChange(e => {
-      if (e.key !== LuoguAuthProvider.SecretKey) return;
-      this.cacheLock = this.cacheLock.then(
-        () => this.reloadSession(),
-        () => this.reloadSession()
-      );
-    });
+    this._disposables.push(this._sessionChangeEmitter);
+    this._disposables.push(
+      this.secretStorage.onDidChange(e => {
+        if (e.key !== LuoguAuthProvider.SecretKey) return;
+        this.cacheLock = this.cacheLock.then(
+          () => this.reloadSession(),
+          () => this.reloadSession()
+        );
+      })
+    );
   }
+
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.disposeReject(new Error('LuoguAuthProvider disposed'));
+    for (const disposable of this._disposables) disposable.dispose();
+  }
+
+  /** 与 dispose 竞速：dispose 后让挂起的网络请求快速失败 */
+  private raceDispose<T>(promise: Promise<T>): Promise<T> {
+    return Promise.race([promise, this.disposeGate]);
+  }
+
+  private async setContext(value: boolean) {
+    if (this.disposed) return;
+    await vscode.commands.executeCommand(
+      'setContext',
+      'luoguLoginStatus',
+      value
+    );
+  }
+
+  private fireChange(
+    event: vscode.AuthenticationProviderAuthenticationSessionsChangeEvent
+  ) {
+    if (this.disposed) return;
+    this._sessionChangeEmitter.fire(event);
+  }
+
   private async initialize() {
     const stored = await this.secretStorage.get(LuoguAuthProvider.SecretKey);
     if (!stored) {
@@ -52,28 +92,30 @@ export default class LuoguAuthProvider
     }
 
     try {
-      const valid = await checkCookie({
-        uid: +session.account.id,
-        clientID: session.accessToken
-      });
+      const valid = await this.raceDispose(
+        checkCookie({
+          uid: +session.account.id,
+          clientID: session.accessToken
+        })
+      );
       if (!valid) {
         await this.secretStorage.delete(LuoguAuthProvider.SecretKey);
         await this.setAnonymousSession();
         return;
       }
     } catch {
-      // Network error: keep the session and validate it on the next request.
+      // dispose 后中止，不再保留 session
+      if (this.disposed) return;
+      // 网络错误：保留 session，下次请求再验证
     }
 
     this.cache = session;
     this.status = true;
-    await vscode.commands.executeCommand(
-      'setContext',
-      'luoguLoginStatus',
-      true
-    );
+    await this.setContext(true);
   }
+
   private async reloadSession() {
+    if (this.disposed) return;
     const stored = await this.secretStorage.get(LuoguAuthProvider.SecretKey);
     if (stored) {
       let session: LuoguSession;
@@ -84,11 +126,7 @@ export default class LuoguAuthProvider
         if (this.status) {
           const removed = this.cache;
           await this.setAnonymousSession();
-          this._sessionChangeEmitter.fire({
-            added: [],
-            changed: [],
-            removed: [removed]
-          });
+          this.fireChange({ added: [], changed: [], removed: [removed] });
         }
         return;
       }
@@ -96,12 +134,8 @@ export default class LuoguAuthProvider
       const previous = this.status ? this.cache : undefined;
       this.cache = session;
       this.status = true;
-      await vscode.commands.executeCommand(
-        'setContext',
-        'luoguLoginStatus',
-        true
-      );
-      this._sessionChangeEmitter.fire({
+      await this.setContext(true);
+      this.fireChange({
         added: previous ? [] : [session],
         removed: [],
         changed: previous ? [session] : []
@@ -112,12 +146,9 @@ export default class LuoguAuthProvider
     if (!this.status) return;
     const removed = this.cache;
     await this.setAnonymousSession();
-    this._sessionChangeEmitter.fire({
-      added: [],
-      changed: [],
-      removed: [removed]
-    });
+    this.fireChange({ added: [], changed: [], removed: [removed] });
   }
+
   private parseSession(value: string): LuoguSession {
     const parsed: unknown = JSON.parse(value);
     if (
@@ -137,22 +168,21 @@ export default class LuoguAuthProvider
     }
     return parsed as LuoguSession;
   }
+
   private async setAnonymousSession() {
     this.cache = new LuoguSession({
       uid: 0,
-      clientID: await genClientID(),
+      clientID: await this.raceDispose(genClientID()),
       name: ''
     });
     this.status = false;
-    await vscode.commands.executeCommand(
-      'setContext',
-      'luoguLoginStatus',
-      false
-    );
+    await this.setContext(false);
   }
+
   get onDidChangeSessions(): vscode.Event<vscode.AuthenticationProviderAuthenticationSessionsChangeEvent> {
     return this._sessionChangeEmitter.event;
   }
+
   async createSession(): Promise<vscode.AuthenticationSession> {
     await this.cacheLock;
     if (this.status) return this.cache;
@@ -166,33 +196,38 @@ export default class LuoguAuthProvider
     this.status = true;
     return session;
   }
+
   async getSessions(): Promise<readonly vscode.AuthenticationSession[]> {
     await this.cacheLock;
     return this.status ? [this.cache] : [];
   }
+
   async removeSession(sessionId: string) {
     await this.cacheLock;
     if (this.status) {
       if (this.cache.id === sessionId) {
-        await this.cookie()
-          .then(c => checkCookie(c))
-          .then(x => (x ? logout() : undefined))
-          .catch(err => {
-            vscode.window.showErrorMessage(
-              `注销失败 ${err instanceof Error ? `：${err.message}` : `。`}\n将直接删除存储的 cookie 信息。`
-            );
-            console.error(err);
-          });
+        await this.raceDispose(
+          this.cookie()
+            .then(c => checkCookie(c))
+            .then(x => (x ? logout() : undefined))
+        ).catch(err => {
+          vscode.window.showErrorMessage(
+            `注销失败 ${err instanceof Error ? `：${err.message}` : `。`}\n将直接删除存储的 cookie 信息。`
+          );
+          console.error(err);
+        });
         await this.secretStorage
           .delete(LuoguAuthProvider.SecretKey)
           .then(() => (this.status = false));
       }
     }
   }
+
   async user() {
     await this.cacheLock;
     return { uid: +this.cache.account.id, name: this.cache.account.label };
   }
+
   async cookie(): Promise<Cookie> {
     await this.cacheLock;
     return { uid: +this.cache.account.id, clientID: this.cache.accessToken };

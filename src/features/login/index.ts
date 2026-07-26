@@ -21,13 +21,18 @@ export const Logout = async () => {
 };
 
 export default function registerLogin(context: vscode.ExtensionContext) {
+  // provider 实例随 subscriptions 自动 dispose，关闭工作区时清理内部资源
+  const provider = (globalThis.luogu.authProvider = new LuoguAuthProvider(
+    context.secrets
+  ));
   context.subscriptions.push(
     vscode.commands.registerCommand('luogu.signin', Login),
     vscode.commands.registerCommand('luogu.signout', Logout),
     vscode.authentication.registerAuthenticationProvider(
       LuoguAuthProvider.ProviderId,
       'Luogu',
-      (globalThis.luogu.authProvider = new LuoguAuthProvider(context.secrets))
-    )
+      provider
+    ),
+    provider
   );
 }
